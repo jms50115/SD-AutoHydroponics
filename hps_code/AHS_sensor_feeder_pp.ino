@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <math.h>
 #include <Servo.h>
+#include <Wire.h>
+#include "Adafruit_HTU21DF.h"
 
 const int TEMP_PIN = A0;
 const float ADC_VREF = 5.0;
@@ -29,10 +31,11 @@ const int PUMP_BASE_B_RUN_CMD  = 0;
 // =============================
 // Control timing
 // =============================
-const unsigned long CONTROL_INTERVAL_MS = 5000UL;    // evaluate controls every 5 sec
-const unsigned long MIX_DELAY_MS        = 120000UL;  // wait 2 min after any dose
-const unsigned long PUMP_GAP_MS         = 2000UL;    // gap between Base A and Base B
-const unsigned long MANUAL_PUMP_RUN_MS = 3000UL;  // 3 seconds
+const unsigned long CONTROL_INTERVAL_MS = 300000UL;   // 5 min
+const unsigned long LOG_INTERVAL_MS     = 300000UL;   // 5 min
+const unsigned long SENSOR_INTERVAL_MS  = 300000UL;   // 5 min
+const unsigned long PUMP_GAP_MS         = 2000UL;
+const unsigned long MANUAL_PUMP_RUN_MS  = 3000UL;
 
 // Start small and calibrate
 const unsigned long PH_DOSE_TIME_MS = 1500UL;
@@ -70,23 +73,40 @@ const int NUM_PLANTS = sizeof(plantProfiles) / sizeof(plantProfiles[0]);
 PlantProfile currentProfile = {"Lettuce", 5.5, 6.5, 0.8, 1.2, 18.0, 24.0, 14};
 
 // =============================
+// Light mode state
+// =============================
+enum LightMode {
+  LIGHT_MODE_AUTO,
+  LIGHT_MODE_MANUAL_ON
+};
+
+LightMode lightMode = LIGHT_MODE_AUTO;
+bool timerWantsLightOn = false;
+bool lightOn = false;
+
+// =============================
 // Runtime state
 // =============================
-bool lightOn = false;
-unsigned long lastLightToggle = 0;
-unsigned long lastDoseTime = 0;
 unsigned long lastControlTime = 0;
+unsigned long lastLogTime = 0;
+unsigned long lastSensorTime = 0;
 
 // cached latest readings
 float lastTempC = NAN;
 float lastPH = NAN;
 float lastEC = NAN;
 
+// HTU21DF variables
+Adafruit_HTU21DF htu = Adafruit_HTU21DF();
+float airTempC = NAN;
+float humidity = NAN;
+
 // last action text for dashboard/debug
 String lastAction = "none";
 
-// manual light override state
-bool manualLightOverride = false;
+// dosing info for current logging interval
+String intervalDoseSolution = "no solution";
+String intervalDoseMode = "no dose";
 
 // =============================
 // Pump servo objects
@@ -96,12 +116,13 @@ Servo pumpPHDown;
 Servo pumpBaseA;
 Servo pumpBaseB;
 
+// Forward declarations
+void sendSensorAndStatusJson(float tempC, float ph, float ec, float airTempC, float humidity);
+void sendLightStatusJson();
+
 // -----------------------------
 // Relay helpers (LIGHT ONLY)
 // -----------------------------
-// If your light relay board is ACTIVE LOW:
-//   relayOn  -> digitalWrite(pin, LOW)
-//   relayOff -> digitalWrite(pin, HIGH)
 void relayOn(int pin) {
   digitalWrite(pin, HIGH);
 }
@@ -125,6 +146,16 @@ void dosePump(Servo &pump, int runCmd, unsigned long durationMs) {
   runPump(pump, runCmd);
   delay(durationMs);
   stopPump(pump);
+}
+
+void recordDoseEvent(const char* solution, const char* mode) {
+  intervalDoseSolution = solution;
+  intervalDoseMode = mode;
+}
+
+void clearDoseEvent() {
+  intervalDoseSolution = "no solution";
+  intervalDoseMode = "no dose";
 }
 
 // -----------------------------
@@ -187,6 +218,65 @@ float toFloatOrNaN(const String &s) {
 }
 
 // -----------------------------
+// Light helpers
+// -----------------------------
+const char* getLightModeString() {
+  if (lightMode == LIGHT_MODE_MANUAL_ON) return "MANUAL_ON";
+  return "AUTO";
+}
+
+const char* getLightStatusString() {
+  if (lightMode == LIGHT_MODE_MANUAL_ON && lightOn) return "on_manual_override";
+  if (lightMode == LIGHT_MODE_AUTO && lightOn) return "on_timer";
+  return "off_timer";
+}
+
+void applyLightOutput() {
+  bool shouldBeOn = false;
+
+  if (lightMode == LIGHT_MODE_MANUAL_ON) {
+    shouldBeOn = true;
+  } else {
+    shouldBeOn = timerWantsLightOn;
+  }
+
+  if (shouldBeOn) {
+    relayOn(LIGHT_PIN);
+    lightOn = true;
+  } else {
+    relayOff(LIGHT_PIN);
+    lightOn = false;
+  }
+}
+
+void setLightModeAuto() {
+  lightMode = LIGHT_MODE_AUTO;
+  applyLightOutput();
+  lastAction = lightOn ? "light_auto_on_timer" : "light_auto_off_timer";
+  sendLightStatusJson();
+}
+
+void setLightModeManualOn() {
+  lightMode = LIGHT_MODE_MANUAL_ON;
+  applyLightOutput();
+  lastAction = "light_manual_on";
+  sendLightStatusJson();
+}
+
+void setTimerLightState(bool on) {
+  timerWantsLightOn = on;
+
+  if (lightMode == LIGHT_MODE_AUTO) {
+    applyLightOutput();
+    lastAction = on ? "light_timer_on" : "light_timer_off";
+  } else {
+    lastAction = on ? "timer_on_ignored_manual" : "timer_off_ignored_manual";
+  }
+
+  sendLightStatusJson();
+}
+
+// -----------------------------
 // Plant profile handling
 // -----------------------------
 bool setPlantProfileByName(String plantName) {
@@ -196,11 +286,9 @@ bool setPlantProfileByName(String plantName) {
     if (plantName.equalsIgnoreCase(plantProfiles[i].name)) {
       currentProfile = plantProfiles[i];
 
-      // restart light schedule when plant changes
-      manualLightOverride = false;
-      lightOn = false;
-      relayOff(LIGHT_PIN);
-      lastLightToggle = millis();
+      lightMode = LIGHT_MODE_AUTO;
+      timerWantsLightOn = false;
+      applyLightOutput();
 
       lastAction = "plant_changed";
       return true;
@@ -226,93 +314,101 @@ void sendCurrentProfileJson() {
   Serial.print(currentProfile.tempMax, 2);
   Serial.print(",\"lightHours\":");
   Serial.print(currentProfile.lightHours);
-  Serial.println("}");
+  Serial.print(",\"lightMode\":\"");
+  Serial.print(getLightModeString());
+  Serial.print("\",\"lightStatus\":\"");
+  Serial.print(getLightStatusString());
+  Serial.println("\"}");
 }
 
 // -----------------------------
 // Pump control
 // -----------------------------
-void dosePHUp() {
+void dosePHUpAuto() {
   dosePump(pumpPHUp, PUMP_PH_UP_RUN_CMD, PH_DOSE_TIME_MS);
-  lastDoseTime = millis();
+  recordDoseEvent("pH Up", "automated dose");
   lastAction = "dose_ph_up";
 }
 
-void dosePHDown() {
+void dosePHDownAuto() {
   dosePump(pumpPHDown, PUMP_PH_DOWN_RUN_CMD, PH_DOSE_TIME_MS);
-  lastDoseTime = millis();
+  recordDoseEvent("pH Down", "automated dose");
   lastAction = "dose_ph_down";
 }
 
-void doseBaseA() {
+void doseBaseAAuto() {
   dosePump(pumpBaseA, PUMP_BASE_A_RUN_CMD, EC_DOSE_TIME_MS);
-  lastDoseTime = millis();
-  lastAction = "manual_dose_a";
+  recordDoseEvent("Base A", "automated dose");
+  lastAction = "dose_base_a";
 }
 
-void doseBaseB() {
+void doseBaseBAuto() {
   dosePump(pumpBaseB, PUMP_BASE_B_RUN_CMD, EC_DOSE_TIME_MS);
-  lastDoseTime = millis();
-  lastAction = "manual_dose_b";
+  recordDoseEvent("Base B", "automated dose");
+  lastAction = "dose_base_b";
 }
 
-void doseNutrients() {
+void doseNutrientsAuto() {
   dosePump(pumpBaseA, PUMP_BASE_A_RUN_CMD, EC_DOSE_TIME_MS);
   delay(PUMP_GAP_MS);
   dosePump(pumpBaseB, PUMP_BASE_B_RUN_CMD, EC_DOSE_TIME_MS);
 
-  lastDoseTime = millis();
+  recordDoseEvent("Base A + Base B", "automated dose");
   lastAction = "dose_base_a_b";
 }
 
-// -----------------------------
-// Light control
-// -----------------------------
-void setLightState(bool on, const String &actionName) {
-  if (on) {
-    relayOn(LIGHT_PIN);
-  } else {
-    relayOff(LIGHT_PIN);
-  }
-
-  lightOn = on;
-  lastLightToggle = millis();
-  lastAction = actionName;
+void dosePHUpManual() {
+  dosePump(pumpPHUp, PUMP_PH_UP_RUN_CMD, PH_DOSE_TIME_MS);
+  recordDoseEvent("pH Up", "manual dose");
+  lastAction = "manual_dose_ph_up";
 }
 
-void updateLightControl() {
-  if (manualLightOverride) {
-    return;
-  }
+void dosePHDownManual() {
+  dosePump(pumpPHDown, PUMP_PH_DOWN_RUN_CMD, PH_DOSE_TIME_MS);
+  recordDoseEvent("pH Down", "manual dose");
+  lastAction = "manual_dose_ph_down";
+}
 
-  unsigned long now = millis();
+void doseBaseAManual() {
+  dosePump(pumpBaseA, PUMP_BASE_A_RUN_CMD, EC_DOSE_TIME_MS);
+  recordDoseEvent("Base A", "manual dose");
+  lastAction = "manual_dose_a";
+}
 
-  unsigned long onTimeMs  = (unsigned long)currentProfile.lightHours * 60UL * 60UL * 1000UL;
-  unsigned long offTimeMs = (unsigned long)(24 - currentProfile.lightHours) * 60UL * 60UL * 1000UL;
+void doseBaseBManual() {
+  dosePump(pumpBaseB, PUMP_BASE_B_RUN_CMD, EC_DOSE_TIME_MS);
+  recordDoseEvent("Base B", "manual dose");
+  lastAction = "manual_dose_b";
+}
 
-  if (lightOn) {
-    if (now - lastLightToggle >= onTimeMs) {
-      setLightState(false, "light_off");
-    }
-  } else {
-    if (now - lastLightToggle >= offTimeMs) {
-      setLightState(true, "light_on");
-    }
-  }
+void runPHUpManual5s() {
+  dosePump(pumpPHUp, PUMP_PH_UP_RUN_CMD, MANUAL_PUMP_RUN_MS);
+  recordDoseEvent("pH Up", "manual dose");
+  lastAction = "manual_run_ph_up_5s";
+}
+
+void runPHDownManual5s() {
+  dosePump(pumpPHDown, PUMP_PH_DOWN_RUN_CMD, MANUAL_PUMP_RUN_MS);
+  recordDoseEvent("pH Down", "manual dose");
+  lastAction = "manual_run_ph_down_5s";
+}
+
+void runBaseAManual5s() {
+  dosePump(pumpBaseA, PUMP_BASE_A_RUN_CMD, MANUAL_PUMP_RUN_MS);
+  recordDoseEvent("Base A", "manual dose");
+  lastAction = "manual_run_base_a_5s";
+}
+
+void runBaseBManual5s() {
+  dosePump(pumpBaseB, PUMP_BASE_B_RUN_CMD, MANUAL_PUMP_RUN_MS);
+  recordDoseEvent("Base B", "manual dose");
+  lastAction = "manual_run_base_b_5s";
 }
 
 // -----------------------------
 // Dosing control
 // -----------------------------
 void updateDosingControl(float ph, float ec) {
-  unsigned long now = millis();
-
-  // wait after any dose for mixing
-  if (now - lastDoseTime < MIX_DELAY_MS) {
-    return;
-  }
-
-  // ---------- pH control ----------
   if (!isnan(ph)) {
     if (ph < ABSOLUTE_MIN_PH || ph > ABSOLUTE_MAX_PH) {
       lastAction = "ph_out_of_absolute_range";
@@ -320,17 +416,16 @@ void updateDosingControl(float ph, float ec) {
     }
 
     if (ph < currentProfile.phMin) {
-      dosePHUp();
+      dosePHUpAuto();
       return;
     }
 
     if (ph > currentProfile.phMax) {
-      dosePHDown();
+      dosePHDownAuto();
       return;
     }
   }
 
-  // ---------- EC control ----------
   if (!isnan(ec)) {
     if (ec > ABSOLUTE_MAX_EC) {
       lastAction = "ec_above_absolute_max";
@@ -338,7 +433,7 @@ void updateDosingControl(float ph, float ec) {
     }
 
     if (ec < currentProfile.ecMin) {
-      doseNutrients();
+      doseNutrientsAuto();
       return;
     }
 
@@ -353,18 +448,6 @@ void updateDosingControl(float ph, float ec) {
 
 // -----------------------------
 // Incoming command parsing
-// Supported:
-//   PLANT:Lettuce
-//   GET_PROFILE
-//   LIGHT_ON
-//   LIGHT_OFF
-//   LIGHT:ON
-//   LIGHT:OFF
-//   AUTO_LIGHT
-//   DOSE_PH_UP
-//   DOSE_PH_DOWN
-//   DOSE_A
-//   DOSE_B
 // -----------------------------
 void checkForNodeRedCommands() {
   if (Serial.available() > 0) {
@@ -388,54 +471,41 @@ void checkForNodeRedCommands() {
     else if (cmd == "GET_PROFILE") {
       sendCurrentProfileJson();
     }
-    else if (cmd == "LIGHT_ON" || cmd == "LIGHT:ON") {
-      manualLightOverride = true;
-      setLightState(true, "manual_light_on");
+    else if (cmd == "LIGHT_MODE:AUTO") {
+      setLightModeAuto();
     }
-    else if (cmd == "LIGHT_OFF" || cmd == "LIGHT:OFF") {
-      manualLightOverride = true;
-      setLightState(false, "manual_light_off");
+    else if (cmd == "LIGHT_MODE:MANUAL_ON") {
+      setLightModeManualOn();
     }
-    else if (cmd == "AUTO_LIGHT") {
-      manualLightOverride = false;
-      lastLightToggle = millis();
-      lastAction = "auto_light_enabled";
+    else if (cmd == "TIMER_LIGHT:ON") {
+      setTimerLightState(true);
     }
-
-    // Existing short manual dose commands
+    else if (cmd == "TIMER_LIGHT:OFF") {
+      setTimerLightState(false);
+    }
     else if (cmd == "DOSE_PH_UP") {
-      dosePHUp();
+      dosePHUpManual();
     }
     else if (cmd == "DOSE_PH_DOWN") {
-      dosePHDown();
+      dosePHDownManual();
     }
     else if (cmd == "DOSE_A") {
-      doseBaseA();
+      doseBaseAManual();
     }
     else if (cmd == "DOSE_B") {
-      doseBaseB();
+      doseBaseBManual();
     }
-
-    // New 5-second manual pump run commands
     else if (cmd == "RUN_PH_UP_5S") {
-      dosePump(pumpPHUp, PUMP_PH_UP_RUN_CMD, MANUAL_PUMP_RUN_MS);
-      lastDoseTime = millis();
-      lastAction = "manual_run_ph_up_5s";
+      runPHUpManual5s();
     }
     else if (cmd == "RUN_PH_DOWN_5S") {
-      dosePump(pumpPHDown, PUMP_PH_DOWN_RUN_CMD, MANUAL_PUMP_RUN_MS);
-      lastDoseTime = millis();
-      lastAction = "manual_run_ph_down_5s";
+      runPHDownManual5s();
     }
     else if (cmd == "RUN_BASE_A_5S") {
-      dosePump(pumpBaseA, PUMP_BASE_A_RUN_CMD, MANUAL_PUMP_RUN_MS);
-      lastDoseTime = millis();
-      lastAction = "manual_run_base_a_5s";
+      runBaseAManual5s();
     }
     else if (cmd == "RUN_BASE_B_5S") {
-      dosePump(pumpBaseB, PUMP_BASE_B_RUN_CMD, MANUAL_PUMP_RUN_MS);
-      lastDoseTime = millis();
-      lastAction = "manual_run_base_b_5s";
+      runBaseBManual5s();
     }
   }
 }
@@ -443,7 +513,29 @@ void checkForNodeRedCommands() {
 // -----------------------------
 // JSON output
 // -----------------------------
-void sendSensorAndStatusJson(float tempC, float ph, float ec) {
+void sendLightStatusJson() {
+  Serial.print("{\"lightOn\":");
+  Serial.print(lightOn ? "true" : "false");
+
+  Serial.print(",\"lightMode\":\"");
+  Serial.print(getLightModeString());
+  Serial.print("\"");
+
+  Serial.print(",\"lightStatus\":\"");
+  Serial.print(getLightStatusString());
+  Serial.print("\"");
+
+  Serial.print(",\"timerWantsLightOn\":");
+  Serial.print(timerWantsLightOn ? "true" : "false");
+
+  Serial.print(",\"lastAction\":\"");
+  Serial.print(lastAction);
+  Serial.print("\"");
+
+  Serial.println("}");
+}
+
+void sendSensorAndStatusJson(float tempC, float ph, float ec, float airTempC, float humidity) {
   Serial.print("{\"tempC\":");
   Serial.print(tempC, 2);
 
@@ -454,6 +546,14 @@ void sendSensorAndStatusJson(float tempC, float ph, float ec) {
   Serial.print(",\"ec\":");
   if (isnan(ec)) Serial.print("null");
   else Serial.print(ec, 3);
+
+  Serial.print(",\"solution\":\"");
+  Serial.print(intervalDoseSolution);
+  Serial.print("\"");
+
+  Serial.print(",\"mode\":\"");
+  Serial.print(intervalDoseMode);
+  Serial.print("\"");
 
   Serial.print(",\"plant\":\"");
   Serial.print(currentProfile.name);
@@ -483,8 +583,24 @@ void sendSensorAndStatusJson(float tempC, float ph, float ec) {
   Serial.print(",\"lightOn\":");
   Serial.print(lightOn ? "true" : "false");
 
-  Serial.print(",\"manualLightOverride\":");
-  Serial.print(manualLightOverride ? "true" : "false");
+  Serial.print(",\"lightMode\":\"");
+  Serial.print(getLightModeString());
+  Serial.print("\"");
+
+  Serial.print(",\"lightStatus\":\"");
+  Serial.print(getLightStatusString());
+  Serial.print("\"");
+
+  Serial.print(",\"timerWantsLightOn\":");
+  Serial.print(timerWantsLightOn ? "true" : "false");
+
+  Serial.print(",\"airTempC\":");
+  if (isnan(airTempC)) Serial.print("null");
+  else Serial.print(airTempC, 2);
+
+  Serial.print(",\"humidity\":");
+  if (isnan(humidity)) Serial.print("null");
+  else Serial.print(humidity, 2);
 
   Serial.print(",\"lastAction\":\"");
   Serial.print(lastAction);
@@ -494,7 +610,6 @@ void sendSensorAndStatusJson(float tempC, float ph, float ec) {
 }
 
 void setup() {
-  // Match Node-RED flow serial config
   Serial.begin(57600);
 
   Serial1.begin(9600);
@@ -503,23 +618,30 @@ void setup() {
   pinMode(LIGHT_PIN, OUTPUT);
   relayOff(LIGHT_PIN);
 
-  // Attach pump servos
+  Wire.begin();
+  if (!htu.begin()) {
+    Serial.println("{\"error\":\"HTU21D_not_found\"}");
+  }
+
   pumpPHUp.attach(PUMP_PH_UP_PIN);
   pumpPHDown.attach(PUMP_PH_DOWN_PIN);
   pumpBaseA.attach(PUMP_BASE_A_PIN);
   pumpBaseB.attach(PUMP_BASE_B_PIN);
 
-  // Stop all pumps at startup
   stopPump(pumpPHUp);
   stopPump(pumpPHDown);
   stopPump(pumpBaseA);
   stopPump(pumpBaseB);
 
-  lightOn = false;
-  manualLightOverride = false;
-  lastLightToggle = millis();
-  lastDoseTime = 0;
+  lightMode = LIGHT_MODE_AUTO;
+  timerWantsLightOn = false;
+  applyLightOutput();
+
   lastControlTime = 0;
+  lastLogTime = 0;
+  lastSensorTime = 0;cm
+
+  clearDoseEvent();
 
   delay(1000);
 
@@ -531,33 +653,39 @@ void setup() {
 
   Serial.println("{\"status\":\"boot\"}");
   sendCurrentProfileJson();
+  sendLightStatusJson();
 }
 
 void loop() {
-  checkForNodeRedCommands(); 
-
-  float tempC = readTemperatureC();
-
-  String phStr = readEzoReading(Serial1);
-  String ecStr = readEzoReading(Serial2);
-
-  float ph = toFloatOrNaN(phStr);
-  float ec = toFloatOrNaN(ecStr) / 1000.0;  // convert μS/cm → mS/cm
-
-
-  lastTempC = tempC;
-  lastPH = ph;
-  lastEC = ec;
-
-  updateLightControl();
+  checkForNodeRedCommands();
 
   unsigned long now = millis();
-  if (now - lastControlTime >= CONTROL_INTERVAL_MS) {
-    lastControlTime = now;
-    updateDosingControl(ph, ec);
+
+  if (now - lastSensorTime >= SENSOR_INTERVAL_MS || lastSensorTime == 0) {
+    lastSensorTime = now;
+
+    lastTempC = readTemperatureC();
+
+    String phStr = readEzoReading(Serial1);
+    String ecStr = readEzoReading(Serial2);
+
+    airTempC = htu.readTemperature();
+    humidity = htu.readHumidity();
+
+    lastPH = toFloatOrNaN(phStr);
+    lastEC = toFloatOrNaN(ecStr) / 1000.0;
   }
 
-  sendSensorAndStatusJson(tempC, ph, ec);
+  if (now - lastControlTime >= CONTROL_INTERVAL_MS || lastControlTime == 0) {
+    lastControlTime = now;
+    updateDosingControl(lastPH, lastEC);
+  }
 
-  delay(2000);
+  if (now - lastLogTime >= LOG_INTERVAL_MS || lastLogTime == 0) {
+    lastLogTime = now;
+    sendSensorAndStatusJson(lastTempC, lastPH, lastEC, airTempC, humidity);
+    clearDoseEvent();
+  }
+
+  delay(10);
 }
